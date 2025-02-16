@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # Auteur : Rymentz
-# v1.0.0
+# v1.0.1
 
 import nest_asyncio
 nest_asyncio.apply()
@@ -37,6 +37,35 @@ logger = logging.getLogger(__name__)
 
 # Global variable for the database connection
 db_conn = None
+
+# --- HELPER FUNCTION: fetch_with_retry ---
+async def fetch_with_retry(session: aiohttp.ClientSession, url: str, timeout: int = 10, retries: int = 3):
+    for attempt in range(retries):
+        try:
+            async with session.get(url, timeout=timeout) as response:
+                if response.status == 200:
+                    return await response.json()
+                else:
+                    logger.error("API call to %s returned status %s", url, response.status)
+                    return None
+        except asyncio.TimeoutError as te:
+            logger.warning("Timeout on attempt %d for url: %s", attempt + 1, url)
+            await asyncio.sleep(2 ** attempt)  # exponential backoff
+        except Exception as e:
+            logger.error("Error fetching data from %s: %s", url, e)
+            break
+    return None
+
+# --- GLOBAL ERROR HANDLER ---
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Global error handler to capture exceptions."""
+    logger.error("Exception occurred: %s", context.error, exc_info=context.error)
+    # Optionally notify the user if possible
+    if update and hasattr(update, "effective_message") and update.effective_message:
+        try:
+            await update.effective_message.reply_text("An unexpected error occurred. Please try again later.")
+        except Exception as e:
+            logger.error("Failed to send error message: %s", e)
 
 # --- INITIALIZING THE DATABASE ---
 async def init_db():
@@ -229,7 +258,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "Hey, the bot is already running in this chat! 😊\n\n"
             "Available commands:\n"
             "🚀 /start - Restart the bot (message already displayed)\n"
-            "➕ /addaddress <kaspa_address> - Add a Kaspa address to monitor\n"
+            "➕ /wallet <kaspa_address> - Add a Kaspa address to monitor\n"
             "📜 /myaddresses - View your monitored addresses\n"
             "💰 /donation - Donation information\n"
             "❓ /help - Help\n"
@@ -249,7 +278,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "Welcome! 😃 You are now registered to monitor Kaspa addresses.\n\n"
             "Available commands:\n"
             "🚀 /start - Start or restart the bot\n"
-            "➕ /addaddress <kaspa_address> - Add a Kaspa address to monitor\n"
+            "➕ /wallet <kaspa_address> - Add a Kaspa address to monitor\n"
             "📜 /myaddresses - View your monitored addresses (with delete option)\n"
             "💰 /donation - Donation information\n"
             "❓ /help - Help\n"
@@ -258,16 +287,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def add_address(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    /addaddress <kaspa_address>
+    /wallet <kaspa_address>
     - Validates the address format.
     - Uses the Kaspa API to ensure that it has completed at least one transaction.
     - Registers the address for the chat if it does not already exist and creates an initial record in the history.
     """
     chat_id = update.effective_chat.id
-    await record_message(chat_id, "addaddress")
+    await record_message(chat_id, "wallet")
     args = context.args
     if len(args) != 1:
-        await update.message.reply_text("Usage: /addaddress <kaspa_address> 😇")
+        await update.message.reply_text("Usage: /wallet <kaspa_address> 😇")
         return
 
     address = args[0].strip()
@@ -275,20 +304,13 @@ async def add_address(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text("The Kaspa address format is incorrect. 😕")
         return
 
-    # Call the transactions count endpoint asynchronously.
-    count_url = f"{KASPA_API_URL}/addresses/{address}/transactions-count"
     headers = {"Accept": "application/json"}
-    try:
-        async with aiohttp.ClientSession(headers=headers) as session:
-            async with session.get(count_url, timeout=10) as response:
-                if response.status != 200:
-                    await update.message.reply_text("Error verifying the address (API error code). 😢")
-                    return
-                data = await response.json()
-    except Exception as e:
-        logger.error("Error calling the Kaspa API for transactions count: %s", e)
-        await update.message.reply_text("Error verifying the address. 😢")
-        return
+    count_url = f"{KASPA_API_URL}/addresses/{address}/transactions-count"
+    async with aiohttp.ClientSession(headers=headers) as session:
+        data = await fetch_with_retry(session, count_url, timeout=10, retries=3)
+        if data is None:
+            await update.message.reply_text("Error verifying the address (API timeout or error). 😢")
+            return
 
     if data.get("limit_exceeded", False):
         logger.warning("Transaction count limit exceeded for address %s", address)
@@ -316,18 +338,12 @@ async def add_address(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     # Retrieve the initial balance and store it in the history.
     async with aiohttp.ClientSession(headers=headers) as session:
         balance_url = f"{KASPA_API_URL}/addresses/{address}/balance"
-        try:
-            async with session.get(balance_url, timeout=10) as response:
-                if response.status != 200:
-                    await update.message.reply_text("Error retrieving the balance for the address. 😢")
-                    return
-                data_balance = await response.json()
-                balance = data_balance.get("balance", 0)
-                kas_value = balance / 100_000_000
-        except Exception as e:
-            logger.error("Error retrieving balance for %s: %s", address, e)
+        data_balance = await fetch_with_retry(session, balance_url, timeout=10, retries=3)
+        if data_balance is None:
             await update.message.reply_text("Error retrieving the balance for the address. 😢")
             return
+        balance = data_balance.get("balance", 0)
+        kas_value = balance / 100_000_000
 
     current_time = datetime.now(timezone.utc).isoformat()
     await db_conn.execute(
@@ -360,7 +376,6 @@ async def myaddresses(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     for record_id, address, added_date in rows:
         date_only = added_date.split("T")[0]
         reply_text += f"• {address} (added on {date_only})\n"
-        # Display a delete button with a trash can icon (using the last 6 characters of the address)
         keyboard.append([InlineKeyboardButton(f"🗑 Delete {address[-6:]}", callback_data=f"delete_address:{record_id}")])
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(reply_text, reply_markup=reply_markup)
@@ -405,17 +420,11 @@ async def donation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     Displays the donation address and the total Kas received (converted by dividing by 100,000,000).
     """
     headers = {"Accept": "application/json"}
+    url = f"{KASPA_API_URL}/addresses/{DONATION_ADDRESS}/balance"
     async with aiohttp.ClientSession(headers=headers) as session:
-        url = f"{KASPA_API_URL}/addresses/{DONATION_ADDRESS}/balance"
-        try:
-            async with session.get(url, timeout=10) as response:
-                if response.status != 200:
-                    await update.message.reply_text("Oops, error retrieving donation data (API). 😢")
-                    return
-                data = await response.json()
-        except Exception as e:
-            logger.error("Error calling the Kaspa API for donations: %s", e)
-            await update.message.reply_text("Error retrieving donation data. 😢")
+        data = await fetch_with_retry(session, url, timeout=10, retries=3)
+        if data is None:
+            await update.message.reply_text("Oops, error retrieving donation data (API). 😢")
             return
 
     balance = data.get("balance", 0)
@@ -434,7 +443,7 @@ async def aide(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     help_text = (
         "Hello! 👋 Welcome to the Kaspa Wallet Monitor Help. Here are the available commands:\n\n"
         "/start - Register your chat and initialize your monitoring 😊\n"
-        "/addaddress <kaspa_address> - Add a Kaspa address to monitor (it must have completed at least one transaction) ➕\n"
+        "/wallet <kaspa_address> - Add a Kaspa address to monitor (it must have completed at least one transaction) ➕\n"
         "/myaddresses - List your monitored addresses with the option to delete each 🗑\n"
         "/donation - Show the donation address and total Kas received 💰\n"
         "/help - Display this help message ❓\n\n"
@@ -457,16 +466,10 @@ async def check_addresses(bot) -> None:
     async with aiohttp.ClientSession(headers=headers) as session:
         for record_id, chat_id, address, last_tx in rows:
             tx_count_url = f"{KASPA_API_URL}/addresses/{address}/transactions-count"
-            try:
-                async with session.get(tx_count_url, timeout=10) as response:
-                    if response.status != 200:
-                        continue
-                    data = await response.json()
-                    new_tx_count = data.get("total", 0)
-            except Exception as e:
-                logger.error("Error checking address %s: %s", address, e)
+            data = await fetch_with_retry(session, tx_count_url, timeout=10, retries=3)
+            if data is None:
                 continue
-
+            new_tx_count = data.get("total", 0)
             if new_tx_count > last_tx:
                 await db_conn.execute(
                     "UPDATE kaspa_addresses SET last_tx_count = ? WHERE id = ?",
@@ -482,16 +485,11 @@ async def check_addresses(bot) -> None:
                 old_balance = res[0] if res else 0
 
                 balance_url = f"{KASPA_API_URL}/addresses/{address}/balance"
-                try:
-                    async with session.get(balance_url, timeout=10) as response:
-                        if response.status != 200:
-                            continue
-                        data_balance = await response.json()
-                        balance = data_balance.get("balance", 0)
-                        kas_value = balance / 100_000_000
-                except Exception as e:
-                    logger.error("Error retrieving balance for %s: %s", address, e)
+                data_balance = await fetch_with_retry(session, balance_url, timeout=10, retries=3)
+                if data_balance is None:
                     continue
+                balance = data_balance.get("balance", 0)
+                kas_value = balance / 100_000_000
 
                 if kas_value == old_balance:
                     logger.info("Transaction detected for address %s but balance hasn't changed.", address)
@@ -507,38 +505,28 @@ async def check_addresses(bot) -> None:
                 direction = "📥 Received" if difference > 0 else "📤 Sent"
                 target_info = ""
                 tx_page_url = f"{KASPA_API_URL}/addresses/{address}/full-transactions-page?limit=1"
-                try:
-                    async with session.get(tx_page_url, timeout=10) as tx_response:
-                        if tx_response.status == 200:
-                            tx_data = await tx_response.json()
-                            if tx_data and isinstance(tx_data, list) and len(tx_data) > 0:
-                                tx = tx_data[0]
-                                if difference > 0:
-                                    # For an incoming transaction, extract the sender address.
-                                    sender = None
-                                    for inp in tx.get("inputs", []):
-                                        candidate = inp.get("previous_outpoint_address")
-                                        if not candidate and inp.get("previous_outpoint_resolved"):
-                                            candidate = inp["previous_outpoint_resolved"].get("script_public_key_address")
-                                        if candidate and candidate != address:
-                                            sender = candidate
-                                            break
-                                    target_info = f"\nFrom: {sender}" if sender else ""
-                                else:
-                                    # For an outgoing transaction, extract the recipient address.
-                                    recipient = None
-                                    for out in tx.get("outputs", []):
-                                        candidate = out.get("script_public_key_address")
-                                        if candidate and candidate != address:
-                                            recipient = candidate
-                                            break
-                                    target_info = f"\nTo: {recipient}" if recipient else ""
-                            else:
-                                target_info = ""
-                        else:
-                            target_info = ""
-                except Exception as e:
-                    logger.error("Error retrieving transaction details for %s: %s", address, e)
+                tx_data = await fetch_with_retry(session, tx_page_url, timeout=10, retries=3)
+                if tx_data and isinstance(tx_data, list) and len(tx_data) > 0:
+                    tx = tx_data[0]
+                    if difference > 0:
+                        sender = None
+                        for inp in tx.get("inputs", []):
+                            candidate = inp.get("previous_outpoint_address")
+                            if not candidate and inp.get("previous_outpoint_resolved"):
+                                candidate = inp["previous_outpoint_resolved"].get("script_public_key_address")
+                            if candidate and candidate != address:
+                                sender = candidate
+                                break
+                        target_info = f"\nFrom: {sender}" if sender else ""
+                    else:
+                        recipient = None
+                        for out in tx.get("outputs", []):
+                            candidate = out.get("script_public_key_address")
+                            if candidate and candidate != address:
+                                recipient = candidate
+                                break
+                        target_info = f"\nTo: {recipient}" if recipient else ""
+                else:
                     target_info = ""
 
                 current_time = datetime.now(timezone.utc).isoformat()
@@ -615,11 +603,12 @@ async def main() -> None:
     
     application = ApplicationBuilder().token(BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("addaddress", add_address))
+    application.add_handler(CommandHandler("wallet", add_address))
     application.add_handler(CommandHandler("donation", donation))
     application.add_handler(CommandHandler("myaddresses", myaddresses))
     application.add_handler(CommandHandler("help", aide))
     application.add_handler(CallbackQueryHandler(delete_address_callback, pattern=r"^delete_address:\d+$"))
+    application.add_error_handler(error_handler)  # Register global error handler
 
     scheduler = AsyncIOScheduler(timezone="UTC")
     # Monthly donation/donators summary job. Every 1st of the month at 00:00.
