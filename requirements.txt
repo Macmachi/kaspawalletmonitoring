@@ -1,0 +1,5 @@
+aiohttp==3.11.12
+aiosqlite==0.21.0
+python-telegram-bot==21.10
+apscheduler==3.11.0
+nest_asyncio==1.6.0
