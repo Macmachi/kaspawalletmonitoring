@@ -123,6 +123,11 @@ The bot uses a SQLite database (`bot_database.db`) with the following tables:
 - **Monthly Donation Summary (`send_monthly_donation_message`)**  
   Runs on the first day of each month at midnight to compile and send a donation summary to all registered chats.
 
+## 💖 Support the Project
+
+If you appreciate this project, you can support the developer by donating to the following Kaspa address:
+`kaspa:qp02azashge2ltj868lmpasj098eul0sphzzvq6am7zx40chug0z6e85xa7ms`
+
 ## Contribution
 
 Contributions are welcome!  
