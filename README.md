@@ -17,7 +17,7 @@ This project implements a **Telegram bot** that monitors Kaspa addresses by inte
 - 🎮 **Bot Commands**  
   The bot provides several commands for an intuitive user experience:
   - `/start` – Registers the chat and displays the list of available commands.
-  - `/addaddress <kaspa_address>` – Adds a Kaspa address to monitor after validating the address format and confirming it has at least one completed transaction.
+  - `/wallet <kaspa_address>` – Adds a Kaspa address to monitor after validating the address format and confirming it has at least one completed transaction.
   - `/myaddresses` – Lists the monitored addresses for the chat and offers a delete option for each.
   - `/donation` – Displays the donation address and shows the total amount of Kas received.
   - `/help` – Provides help on how to use the bot.
