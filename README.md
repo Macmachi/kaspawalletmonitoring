@@ -1,6 +1,8 @@
 #  Kaspa Wallet Monitoring (Telegram Bot)
 This project implements a **Telegram bot** that monitors Kaspa addresses by interfacing with a dedicated API. The bot checks for new transactions and balance changes for each registered Kaspa address and provides notifications directly via Telegram. Users can also manage their monitored addresses with simple bot commands.
 
+My bot is available on Telegram: @kaspawalletmonitor_bot
+
 ## Features
 
 - **Database Initialization**  
