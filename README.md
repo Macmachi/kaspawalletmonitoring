@@ -36,7 +36,7 @@ This project implements a **Telegram bot** that monitors Kaspa addresses by inte
 
 ### Prerequisites
 
-- Python 3.7 or higher
+- Python 3.12 or higher
 - A Telegram API key (BOT_TOKEN) obtained from [BotFather](https://core.telegram.org/bots#botfather)
 - Kaspa API URL and a donation address
 
