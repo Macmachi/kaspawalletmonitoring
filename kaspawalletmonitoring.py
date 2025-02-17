@@ -1,18 +1,19 @@
 # -*- coding: utf-8 -*-
 # Auteur : Rymentz
-# v1.0.1
+# v1.0.2
 
 import nest_asyncio
 nest_asyncio.apply()
 import asyncio
 import logging
+from logging.handlers import TimedRotatingFileHandler
 logging.getLogger("httpx").setLevel(logging.WARNING)
 import re
 from datetime import datetime, timezone
 
 import aiohttp
 import aiosqlite
-import configparser  # For reading the configuration file
+import configparser  
 
 # Telegram and APScheduler imports
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -29,14 +30,32 @@ config.read("config.ini")
 BOT_TOKEN = config.get("telegram", "BOT_TOKEN")
 KASPA_API_URL = config.get("kaspa", "KASPA_API_URL")
 DONATION_ADDRESS = config.get("kaspa", "DONATION_ADDRESS")
+CMC_API_KEY = config.get("coinmarketcap", "API_KEY")
+KASPA_CMC_ID = config.get("coinmarketcap", "KASPA_ID")
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+# Set the logger level to INFO
+logger.setLevel(logging.INFO)
+# Create a handler that rotates the logs weekly and keeps 6 files (6 weeks)
+handler = TimedRotatingFileHandler(
+    "bot.log",      # name of the log file
+    when="W0",      # "W0" for weekly rotation 
+    interval=1,     # interval of 1 week
+    backupCount=6   # retain the last 6 log files (i.e., 6 weeks)
+)
+# Define a format for the logs
+formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+handler.setFormatter(formatter)
+# Add the handler to the logger
+logger.addHandler(handler)
 
 # Global variable for the database connection
 db_conn = None
+# Global variable for Kaspa price
+current_kaspa_price = 0.0
 
 # --- HELPER FUNCTION: fetch_with_retry ---
 async def fetch_with_retry(session: aiohttp.ClientSession, url: str, timeout: int = 10, retries: int = 3):
@@ -456,27 +475,32 @@ async def aide(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def check_addresses(bot) -> None:
     """
     Checks every minute for each monitored address for new transactions.
-    If a new transaction is detected, it updates the transaction counter, records the new balance, and sends an alert message
-    only if the balance changed.
-    In case of an error (e.g., bot is blocked or chat deleted), the chat is removed from the database.
+    If a new transaction is detected, it updates the transaction counter,
+    records the new balance, and sends an alert message only if the balance changed.
+    In case of an error (e.g., if the bot is blocked or the chat is deleted),
+    the chat is removed from the database.
     """
     async with db_conn.execute("SELECT id, chat_id, address, last_tx_count FROM kaspa_addresses") as cursor:
         rows = await cursor.fetchall()
     headers = {"Accept": "application/json"}
+    
     async with aiohttp.ClientSession(headers=headers) as session:
         for record_id, chat_id, address, last_tx in rows:
+            # Retrieve the count of transactions for the address
             tx_count_url = f"{KASPA_API_URL}/addresses/{address}/transactions-count"
             data = await fetch_with_retry(session, tx_count_url, timeout=10, retries=3)
             if data is None:
                 continue
             new_tx_count = data.get("total", 0)
             if new_tx_count > last_tx:
+                # Update the transaction counter in the database
                 await db_conn.execute(
                     "UPDATE kaspa_addresses SET last_tx_count = ? WHERE id = ?",
                     (new_tx_count, record_id)
                 )
                 await db_conn.commit()
 
+                # Retrieve the previous balance from the history
                 async with db_conn.execute(
                     "SELECT balance FROM balance_history WHERE chat_id = ? AND address = ? ORDER BY record_date DESC LIMIT 1",
                     (chat_id, address)
@@ -484,6 +508,7 @@ async def check_addresses(bot) -> None:
                     res = await cursor2.fetchone()
                 old_balance = res[0] if res else 0
 
+                # Retrieve the new balance via the API
                 balance_url = f"{KASPA_API_URL}/addresses/{address}/balance"
                 data_balance = await fetch_with_retry(session, balance_url, timeout=10, retries=3)
                 if data_balance is None:
@@ -491,10 +516,12 @@ async def check_addresses(bot) -> None:
                 balance = data_balance.get("balance", 0)
                 kas_value = balance / 100_000_000
 
+                # If the balance hasn't changed, do nothing
                 if kas_value == old_balance:
                     logger.info("Transaction detected for address %s but balance hasn't changed.", address)
                     continue
 
+                # Calculate the difference and percentage change
                 if old_balance > 0:
                     difference = kas_value - old_balance
                     percentage_change = (difference / old_balance) * 100
@@ -503,9 +530,28 @@ async def check_addresses(bot) -> None:
                     percentage_change = 100
 
                 direction = "📥 Received" if difference > 0 else "📤 Sent"
-                target_info = ""
+
+                # Convert the transaction amount from Kaspa to USD
+                usd_amount = abs(difference) * current_kaspa_price
+
+                # Use the API to retrieve the most recent transaction via full-transactions-page
                 tx_page_url = f"{KASPA_API_URL}/addresses/{address}/full-transactions-page?limit=1"
                 tx_data = await fetch_with_retry(session, tx_page_url, timeout=10, retries=3)
+                tx_id = None
+                if tx_data and isinstance(tx_data, list) and len(tx_data) > 0:
+                    tx = tx_data[0]
+                    # According to the API documentation, the output includes a "transaction_id" field;
+                    # no need for a fallback since the documentation confirms it.
+                    tx_id = tx.get("transaction_id")
+                
+                # Build the link: if tx_id is available, redirect to the transaction; otherwise, to the address page
+                if tx_id:
+                    link = f"https://explorer.kaspa.org/txs/{tx_id}"
+                else:
+                    link = f"https://explorer.kaspa.org/addresses/{address}?page=1"
+
+                # Optionally retrieve additional transaction details (e.g., sender or recipient)
+                target_info = ""
                 if tx_data and isinstance(tx_data, list) and len(tx_data) > 0:
                     tx = tx_data[0]
                     if difference > 0:
@@ -529,6 +575,7 @@ async def check_addresses(bot) -> None:
                 else:
                     target_info = ""
 
+                # Record the new balance in the history
                 current_time = datetime.now(timezone.utc).isoformat()
                 await db_conn.execute(
                     "INSERT INTO balance_history (chat_id, address, record_date, balance) VALUES (?,?,?,?)",
@@ -536,13 +583,14 @@ async def check_addresses(bot) -> None:
                 )
                 await db_conn.commit()
 
+                # Construct and send the alert message  
                 alert_message = (
-                    f"🎉 New transaction detected for address "
-                    f"<a href='https://explorer.kaspa.org/addresses/{address}?page=1'>{address}</a>! 😊\n"
-                    f"🔴 Previous balance: {old_balance} Kas\n"
-                    f"🟢 New balance: {kas_value} Kas\n"
+                    f"🎉 New transaction detected for address: "
+                    f"<a href='{link}'>{address}</a>\n"
+                    f"🔴 Previous balance: {old_balance:.2f} Kas\n"
+                    f"🟢 New balance: {kas_value:.2f} Kas\n"
                     f"🔄 Change: {percentage_change:.2f}% compared to the previous balance.\n"
-                    f"💸 Amount {direction}: {abs(difference):.2f} Kas"
+                    f"💸 Amount {direction}: {difference:+.2f} Kas (~{usd_amount:.2f} USD)"
                     f"{target_info}"
                 )
                 try:
@@ -596,6 +644,34 @@ async def send_monthly_donation_message(context: ContextTypes.DEFAULT_TYPE) -> N
         except Exception as e:
             logger.error("Error sending monthly donation summary to chat %s: %s", chat_id, e)
 
+# --- GETTING THE PRICE OF KASPA ---
+async def update_kaspa_price():
+    """
+    Retrieves the price of Kaspa in USD via the CoinMarketCap API every 15 minutes.
+    In case of an error, logs the incident and keeps the last known value.
+    """
+    global current_kaspa_price
+    headers = {
+         "Accept": "application/json",
+         "X-CMC_PRO_API_KEY": CMC_API_KEY  
+    }
+    # Using the unique ID for the request
+    url = f"https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest?id={KASPA_CMC_ID}&convert=USD"
+    async with aiohttp.ClientSession(headers=headers) as session:
+         data = await fetch_with_retry(session, url, timeout=10, retries=3)
+         if data:
+             try:
+                 # Extract the price from the JSON response.
+                 # The key in 'data' corresponds to the used ID, here converted to a string.
+                 price = data["data"][str(KASPA_CMC_ID)]["quote"]["USD"]["price"]
+                 current_kaspa_price = price
+                 logger.info("Kaspa price updated: %f USD", price)
+             except KeyError:
+                 logger.error("Invalid data format received from CoinMarketCap: %s", data)
+         else:
+             # If the API does not respond, keep the last known value
+             logger.error("Error fetching the price. Last known value: %f USD", current_kaspa_price)
+             
 # --- MAIN ---
 async def main() -> None:
     global db_conn
@@ -609,8 +685,10 @@ async def main() -> None:
     application.add_handler(CommandHandler("help", aide))
     application.add_handler(CallbackQueryHandler(delete_address_callback, pattern=r"^delete_address:\d+$"))
     application.add_error_handler(error_handler)  # Register global error handler
-
     scheduler = AsyncIOScheduler(timezone="UTC")
+    # Optional: trigger a first update to initialize the variable immediately
+    await update_kaspa_price()
+    scheduler.add_job(update_kaspa_price, "interval", minutes=15)
     # Monthly donation/donators summary job. Every 1st of the month at 00:00.
     scheduler.add_job(send_monthly_donation_message, "cron", day=1, hour=0, minute=0, args=[application.bot])
     # Check monitored addresses every minute for new transactions.
