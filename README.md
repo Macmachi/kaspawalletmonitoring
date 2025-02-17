@@ -3,6 +3,13 @@ This project implements a **Telegram bot** that monitors Kaspa addresses by inte
 
 🔗 My bot is available on Telegram: @kaspawalletmonitor_bot
 
+## ✨ Upcoming Features
+
+- 💵 **Kas Balance Conversion to Dollars**  
+  Transaction amounts in Kas will now be displayed not only in Kas but also converted to US dollars using the current exchange rate. This will provide users with a clearer view of the values exchanged.
+- 🔗 **Direct Transaction Link**  
+  When a transaction is detected, the address will be linked to a clickable URL that directs users to the transaction details on the blockchain explorer. This makes it easy for users to verify and track their transactions with just a click.
+
 ## ✨ Features
 
 - 📊 **Database Initialization**  
