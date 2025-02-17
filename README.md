@@ -67,6 +67,10 @@ BOT_TOKEN = your_bot_token_here
 [kaspa]
 KASPA_API_URL = https://api.kaspa.example
 DONATION_ADDRESS = your_donation_address_here
+
+[coinmarketcap]
+API_KEY = your_coinmarketcap_api_key_here
+KASPA_ID = 20396
 ```
 
 ## 📱 How to Use
