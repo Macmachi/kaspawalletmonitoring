@@ -7,7 +7,7 @@ This project implements a **Telegram bot** that monitors Kaspa addresses by inte
 - 💵 **KAS to USD Conversion**  
   Transaction amounts are now displayed in both KAS and USD using current exchange rates for better value tracking.
 - 🔗 **Transaction Explorer Links**  
-  Each transaction notification now includes a direct link to the kaspa explorer for easy verification and tracking.
+  Each notification now includes a direct link to the kaspa explorer transaction for easy verification and tracking.
 
 ## ✨ Features
 
