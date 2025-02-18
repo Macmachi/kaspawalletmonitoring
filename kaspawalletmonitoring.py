@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # Auteur : Rymentz
-# v1.0.2
+# v1.0.3
 
 import nest_asyncio
 nest_asyncio.apply()
@@ -14,6 +14,8 @@ from datetime import datetime, timezone
 import aiohttp
 import aiosqlite
 import configparser  
+import os
+import sys
 
 # Telegram and APScheduler imports
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -33,24 +35,44 @@ DONATION_ADDRESS = config.get("kaspa", "DONATION_ADDRESS")
 CMC_API_KEY = config.get("coinmarketcap", "API_KEY")
 KASPA_CMC_ID = config.get("coinmarketcap", "KASPA_ID")
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
-)
-logger = logging.getLogger(__name__)
-# Set the logger level to INFO
-logger.setLevel(logging.INFO)
+log_dir = "logs"
+if not os.path.exists(log_dir):
+    os.makedirs(log_dir)
+
 # Create a handler that rotates the logs weekly and keeps 6 files (6 weeks)
-handler = TimedRotatingFileHandler(
-    "bot.log",      # name of the log file
-    when="W0",      # "W0" for weekly rotation 
-    interval=1,     # interval of 1 week
-    backupCount=6   # retain the last 6 log files (i.e., 6 weeks)
+log_file = os.path.join(log_dir, "bot.log")
+file_handler = TimedRotatingFileHandler(
+    log_file,
+    when="W0",     # every monday at midnight
+    interval=1,
+    backupCount=6
 )
-# Define a format for the logs
 formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-handler.setFormatter(formatter)
-# Add the handler to the logger
-logger.addHandler(handler)
+file_handler.setFormatter(formatter)
+
+# Configure the root logger to write directly to the file.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[file_handler]
+)
+
+# Définition du logger
+logger = logging.getLogger(__name__)
+
+# Put print in log file
+class LoggerWriter:
+    def __init__(self, level):
+        self.level = level
+    def write(self, message):
+        message = message.strip()
+        if message:
+            self.level(message)
+    def flush(self):
+        pass
+
+sys.stdout = LoggerWriter(logging.getLogger(__name__).info)
+sys.stderr = LoggerWriter(logging.getLogger(__name__).error)
 
 # Global variable for the database connection
 db_conn = None
@@ -436,7 +458,7 @@ async def delete_address_callback(update: Update, context: ContextTypes.DEFAULT_
 async def donation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     /donation
-    Displays the donation address and the total Kas received (converted by dividing by 100,000,000).
+    Displays the donation address and the total Kas received.
     """
     headers = {"Accept": "application/json"}
     url = f"{KASPA_API_URL}/addresses/{DONATION_ADDRESS}/balance"
@@ -448,10 +470,12 @@ async def donation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     balance = data.get("balance", 0)
     kas_value = balance / 100_000_000
+    smiley = "😊" if kas_value > 0 else "😕"
     donation_message = (
         f"Donation address: {DONATION_ADDRESS}\n"
-        f"Total Kas received: {kas_value} Kas 😊"
+        f"Total Kas received: {kas_value} Kas {smiley}"
     )
+    
     await update.message.reply_text(donation_message)
 
 async def aide(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -604,15 +628,10 @@ async def check_addresses(bot) -> None:
 # --- MONTHLY DONATION / DONATOR SUMMARY FUNCTION ---
 async def send_monthly_donation_message(context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    This function is called every month.
-    It retrieves the donation records in the current month (ignoring previous months) and constructs a message listing:
-      - For a transaction where the recipient address is DONATION_ADDRESS:
-            "Donation received from <sender_address> on <date>: <amount> Kas"
-      - For a transaction where the sender address is DONATION_ADDRESS:
-            "Donation sent to <recipient_address> on <date>: <amount> Kas"
-    If no donation is recorded for the month, the default message is:
-            "No donations recorded this month. Let's keep supporting Kaspa! 😔"
-    This message is sent to all registered chats.
+    This function is called every month and sends a donation summary.
+    The message lists the donations recorded this month and appends the following information:
+      - The donation address
+      - A message in English: "If you like my bot, even 1 kaspa helps keep the service operational."
     """
     start_of_month = datetime.now(timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
     async with db_conn.execute(
@@ -633,7 +652,10 @@ async def send_monthly_donation_message(context: ContextTypes.DEFAULT_TYPE) -> N
             elif sender_address == DONATION_ADDRESS:
                 donation_message += f"Donation sent to {recipient_address} on {date_only}: {amount} Kas\n"
     else:
-        donation_message = "No donations recorded this month. Let's keep supporting Kaspa! 😔"
+        donation_message = "No donations recorded this month. Let's keep supporting Kaspa! 😔\n"
+
+    donation_message += f"\nDonation address: {DONATION_ADDRESS}\n"
+    donation_message += "If you like my bot, even 1 kaspa helps keep the service operational."
 
     for (chat_id,) in chat_rows:
         try:
