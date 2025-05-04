@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # Auteur : Rymentz
-# v1.0.3
+# v1.0.4
 
 import nest_asyncio
 nest_asyncio.apply()
@@ -562,11 +562,21 @@ async def check_addresses(bot) -> None:
                 tx_page_url = f"{KASPA_API_URL}/addresses/{address}/full-transactions-page?limit=1"
                 tx_data = await fetch_with_retry(session, tx_page_url, timeout=10, retries=3)
                 tx_id = None
+                is_coinbase = False
+                
                 if tx_data and isinstance(tx_data, list) and len(tx_data) > 0:
                     tx = tx_data[0]
-                    # According to the API documentation, the output includes a "transaction_id" field;
-                    # no need for a fallback since the documentation confirms it.
                     tx_id = tx.get("transaction_id")
+                    
+                    # Check if this is a coinbase (mining) transaction
+                    # Coinbase transactions have no real inputs or have a special coinbase field
+                    if direction == "📥 Received":  # Only check for incoming transactions
+                        # Method 1: Check if inputs are empty or have specific flags
+                        if not tx.get("inputs") or any(inp.get("is_coinbase", False) for inp in tx.get("inputs", [])):
+                            is_coinbase = True
+                        # Method 2: Try to identify by checking input structure
+                        elif len(tx.get("inputs", [])) == 0 and len(tx.get("outputs", [])) > 0:
+                            is_coinbase = True
                 
                 # Build the link: if tx_id is available, redirect to the transaction; otherwise, to the address page
                 if tx_id:
@@ -574,11 +584,15 @@ async def check_addresses(bot) -> None:
                 else:
                     link = f"https://explorer.kaspa.org/addresses/{address}?page=1"
 
-                # Optionally retrieve additional transaction details (e.g., sender or recipient)
+                # Handle transaction details based on transaction type
                 target_info = ""
                 if tx_data and isinstance(tx_data, list) and len(tx_data) > 0:
                     tx = tx_data[0]
-                    if difference > 0:
+                    if is_coinbase:
+                        # This is a mining reward transaction
+                        target_info = "\nFrom: COINBASE (New coins) 🎉"
+                    elif difference > 0:
+                        # Regular incoming transaction
                         sender = None
                         for inp in tx.get("inputs", []):
                             candidate = inp.get("previous_outpoint_address")
@@ -589,6 +603,7 @@ async def check_addresses(bot) -> None:
                                 break
                         target_info = f"\nFrom: {sender}" if sender else ""
                     else:
+                        # Outgoing transaction
                         recipient = None
                         for out in tx.get("outputs", []):
                             candidate = out.get("script_public_key_address")
@@ -596,8 +611,6 @@ async def check_addresses(bot) -> None:
                                 recipient = candidate
                                 break
                         target_info = f"\nTo: {recipient}" if recipient else ""
-                else:
-                    target_info = ""
 
                 # Record the new balance in the history
                 current_time = datetime.now(timezone.utc).isoformat()
@@ -607,9 +620,12 @@ async def check_addresses(bot) -> None:
                 )
                 await db_conn.commit()
 
+                # Customize message for coinbase transactions
+                tx_type = "mining reward" if is_coinbase else "transaction"
+
                 # Construct and send the alert message  
                 alert_message = (
-                    f"🎉 New transaction detected for address: "
+                    f"🎉 New {tx_type} detected for address: "
                     f"<a href='{link}'>{address}</a>\n"
                     f"🔴 Previous balance: {old_balance:.2f} Kas\n"
                     f"🟢 New balance: {kas_value:.2f} Kas\n"
@@ -617,6 +633,7 @@ async def check_addresses(bot) -> None:
                     f"💸 Amount {direction}: {difference:+.2f} Kas (~{usd_amount:.2f} USD)"
                     f"{target_info}"
                 )
+                
                 try:
                     await bot.send_message(chat_id=chat_id, text=alert_message, parse_mode='HTML')
                 except Forbidden as e:
