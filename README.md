@@ -3,6 +3,10 @@ This project implements a **Telegram bot** that monitors Kaspa addresses by inte
 
 🔗 My bot is available on Telegram: @kaspawalletmonitor_bot
 
+What's New in v1.0.3
+- ⛏️ **Mining Rewards Detection**
+  The bot now properly identifies and reports COINBASE transactions (mining rewards) with specific notification formatting.
+
 ### What's New in v1.0.2
 - 💵 **KAS to USD Conversion**  
   Transaction amounts are now displayed in both KAS and USD using current exchange rates for better value tracking.
