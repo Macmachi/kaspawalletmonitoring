@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # Auteur : Rymentz
-# v1.0.4
+# v1.0.5
 
 import nest_asyncio
 nest_asyncio.apply()
@@ -78,6 +78,10 @@ sys.stderr = LoggerWriter(logging.getLogger(__name__).error)
 db_conn = None
 # Global variable for Kaspa price
 current_kaspa_price = 0.0
+# To verify if transaction is accepted or not (timelaps of 2 minutes)
+pending_transactions = {}  # Format: {tx_id: {'address': address, 'first_seen': timestamp, 'chat_id': chat_id, ...}}
+TRANSACTION_TIMEOUT = 300  # 5 minutes in seconds
+MAX_RETRY_ATTEMPTS = 6    # Maximum number of retry attempts for sending notifications
 
 # --- HELPER FUNCTION: fetch_with_retry ---
 async def fetch_with_retry(session: aiohttp.ClientSession, url: str, timeout: int = 10, retries: int = 3):
@@ -501,9 +505,13 @@ async def check_addresses(bot) -> None:
     Checks every minute for each monitored address for new transactions.
     If a new transaction is detected, it updates the transaction counter,
     records the new balance, and sends an alert message only if the balance changed.
-    In case of an error (e.g., if the bot is blocked or the chat is deleted),
-    the chat is removed from the database.
+    Transactions that are not yet accepted are placed in a waiting queue and checked
+    on each run until they are either accepted or reach the 5-minute timeout.
+    Failed notifications will be retried up to 3 times.
     """
+    global pending_transactions
+    current_time = datetime.now(timezone.utc)
+    
     async with db_conn.execute("SELECT id, chat_id, address, last_tx_count FROM kaspa_addresses") as cursor:
         rows = await cursor.fetchall()
     headers = {"Accept": "application/json"}
@@ -563,13 +571,16 @@ async def check_addresses(bot) -> None:
                 tx_data = await fetch_with_retry(session, tx_page_url, timeout=10, retries=3)
                 tx_id = None
                 is_coinbase = False
+                is_accepted = False
                 
                 if tx_data and isinstance(tx_data, list) and len(tx_data) > 0:
                     tx = tx_data[0]
                     tx_id = tx.get("transaction_id")
                     
+                    # Check if the transaction is accepted
+                    is_accepted = tx.get("acceptingBlock") is not None
+                    
                     # Check if this is a coinbase (mining) transaction
-                    # Coinbase transactions have no real inputs or have a special coinbase field
                     if direction == "📥 Received":  # Only check for incoming transactions
                         # Method 1: Check if inputs are empty or have specific flags
                         if not tx.get("inputs") or any(inp.get("is_coinbase", False) for inp in tx.get("inputs", [])):
@@ -578,6 +589,56 @@ async def check_addresses(bot) -> None:
                         elif len(tx.get("inputs", [])) == 0 and len(tx.get("outputs", [])) > 0:
                             is_coinbase = True
                 
+                # If the transaction is not accepted, put it in the waiting queue
+                if tx_id and not is_accepted:
+                    if tx_id not in pending_transactions:
+                        # First time we see this transaction, put it in the waiting queue
+                        pending_transactions[tx_id] = {
+                            'address': address,
+                            'chat_id': chat_id,
+                            'first_seen': current_time,
+                            'old_balance': old_balance,
+                            'new_balance': kas_value,
+                            'difference': difference,
+                            'percentage_change': percentage_change,
+                            'direction': direction,
+                            'usd_amount': usd_amount,
+                            'is_coinbase': is_coinbase,
+                            'link': f"https://explorer.kaspa.org/txs/{tx_id}" if tx_id else f"https://explorer.kaspa.org/addresses/{address}?page=1",
+                            'target_info': "",      # Will be filled later if needed
+                            'send_attempts': 0      # Initialize retry counter
+                        }
+                        
+                        # Build target_info for the pending transaction
+                        if tx_data and isinstance(tx_data, list) and len(tx_data) > 0:
+                            tx = tx_data[0]
+                            if is_coinbase:
+                                pending_transactions[tx_id]['target_info'] = "\nFrom: COINBASE (New coins) 🎉"
+                            elif difference > 0:
+                                # Regular incoming transaction
+                                sender = None
+                                for inp in tx.get("inputs", []):
+                                    candidate = inp.get("previous_outpoint_address")
+                                    if not candidate and inp.get("previous_outpoint_resolved"):
+                                        candidate = inp["previous_outpoint_resolved"].get("script_public_key_address")
+                                    if candidate and candidate != address:
+                                        sender = candidate
+                                        break
+                                pending_transactions[tx_id]['target_info'] = f"\nFrom: {sender}" if sender else ""
+                            else:
+                                # Outgoing transaction
+                                recipient = None
+                                for out in tx.get("outputs", []):
+                                    candidate = out.get("script_public_key_address")
+                                    if candidate and candidate != address:
+                                        recipient = candidate
+                                        break
+                                pending_transactions[tx_id]['target_info'] = f"\nTo: {recipient}" if recipient else ""
+                                
+                        logger.info(f"Transaction {tx_id} not accepted, added to waiting queue for address {address}")
+                    continue  # Skip further processing for this transaction
+                
+                # Process accepted transaction that wasn't in the pending queue
                 # Build the link: if tx_id is available, redirect to the transaction; otherwise, to the address page
                 if tx_id:
                     link = f"https://explorer.kaspa.org/txs/{tx_id}"
@@ -613,10 +674,10 @@ async def check_addresses(bot) -> None:
                         target_info = f"\nTo: {recipient}" if recipient else ""
 
                 # Record the new balance in the history
-                current_time = datetime.now(timezone.utc).isoformat()
+                current_time_iso = datetime.now(timezone.utc).isoformat()
                 await db_conn.execute(
                     "INSERT INTO balance_history (chat_id, address, record_date, balance) VALUES (?,?,?,?)",
-                    (chat_id, address, current_time, kas_value)
+                    (chat_id, address, current_time_iso, kas_value)
                 )
                 await db_conn.commit()
 
@@ -641,9 +702,87 @@ async def check_addresses(bot) -> None:
                     await remove_chat(chat_id)
                 except Exception as e:
                     logger.error("Error sending alert for %s to chat %s: %s", address, chat_id, e)
+        
+        # Check all pending transactions on each run
+        pending_tx_to_check = list(pending_transactions.items())
+        for tx_id, tx_info in pending_tx_to_check:
+            # Check the transaction status again
+            tx_data_url = f"{KASPA_API_URL}/transactions/{tx_id}"
+            tx_data = await fetch_with_retry(session, tx_data_url, timeout=10, retries=3)
+            
+            if tx_data:
+                is_accepted = tx_data.get("acceptingBlock") is not None
+                
+                # If the transaction is now accepted, send notification
+                if is_accepted:
+                    address = tx_info['address']
+                    chat_id = tx_info['chat_id']
+                    old_balance = tx_info['old_balance']
+                    kas_value = tx_info['new_balance']
+                    difference = tx_info['difference']
+                    percentage_change = tx_info['percentage_change']
+                    direction = tx_info['direction']
+                    usd_amount = tx_info['usd_amount']
+                    is_coinbase = tx_info['is_coinbase']
+                    link = tx_info['link']
+                    target_info = tx_info['target_info']
+                    send_attempts = tx_info.get('send_attempts', 0)
+                    
+                    # Only try to send if we haven't reached the maximum retry attempts
+                    if send_attempts < MAX_RETRY_ATTEMPTS:
+                        # Record the new balance in the history if not already done
+                        current_time_iso = datetime.now(timezone.utc).isoformat()
+                        await db_conn.execute(
+                            "INSERT INTO balance_history (chat_id, address, record_date, balance) VALUES (?,?,?,?)",
+                            (chat_id, address, current_time_iso, kas_value)
+                        )
+                        await db_conn.commit()
+                        
+                        # Customize message for coinbase transactions
+                        tx_type = "mining reward" if is_coinbase else "transaction"
+                        
+                        # Construct and send the alert message
+                        alert_message = (
+                            f"🎉 New {tx_type} detected for address: "
+                            f"<a href='{link}'>{address}</a>\n"
+                            f"🔴 Previous balance: {old_balance:.2f} Kas\n"
+                            f"🟢 New balance: {kas_value:.2f} Kas\n"
+                            f"🔄 Change: {percentage_change:.2f}% compared to the previous balance.\n"
+                            f"💸 Amount {direction}: {difference:+.2f} Kas (~{usd_amount:.2f} USD)"
+                            f"{target_info}"
+                        )
+                        
+                        try:
+                            await bot.send_message(chat_id=chat_id, text=alert_message, parse_mode='HTML')
+                            # Notification sent successfully, remove from pending queue
+                            del pending_transactions[tx_id]
+                            logger.info(f"Transaction {tx_id} is now accepted and notification sent successfully")
+                        except Forbidden as e:
+                            logger.error("Bot blocked or chat deleted for chat %s when sending alert: %s", chat_id, e)
+                            await remove_chat(chat_id)
+                            # Remove from pending transactions in case of Forbidden error
+                            del pending_transactions[tx_id]
+                        except Exception as e:
+                            # Increment the retry counter
+                            pending_transactions[tx_id]['send_attempts'] = send_attempts + 1
+                            logger.error(f"Error sending alert for {address} to chat {chat_id}: {e} (attempt {send_attempts + 1}/{MAX_RETRY_ATTEMPTS})")
+                            
+                            # If we've reached the maximum number of attempts, give up and remove from pending
+                            if send_attempts + 1 >= MAX_RETRY_ATTEMPTS:
+                                logger.warning(f"Maximum retry attempts ({MAX_RETRY_ATTEMPTS}) reached for transaction {tx_id}. Notification not sent.")
+                                del pending_transactions[tx_id]
+                    else:
+                        # We've already tried the maximum number of times, remove from pending
+                        logger.warning(f"Maximum retry attempts ({MAX_RETRY_ATTEMPTS}) reached for transaction {tx_id}. Notification not sent.")
+                        del pending_transactions[tx_id]
+                
+                # If transaction has been in the queue for more than 5 minutes and still not accepted, remove it
+                elif (current_time - tx_info['first_seen']).total_seconds() > TRANSACTION_TIMEOUT:
+                    del pending_transactions[tx_id]
+                    logger.info(f"Transaction {tx_id} removed from waiting queue after {TRANSACTION_TIMEOUT} seconds (not accepted)")
 
 # --- MONTHLY DONATION / DONATOR SUMMARY FUNCTION ---
-async def send_monthly_donation_message(context: ContextTypes.DEFAULT_TYPE) -> None:
+async def send_monthly_donation_message(bot) -> None:
     """
     This function is called every month and sends a donation summary.
     The message lists the donations recorded this month and appends the following information:
@@ -676,7 +815,8 @@ async def send_monthly_donation_message(context: ContextTypes.DEFAULT_TYPE) -> N
 
     for (chat_id,) in chat_rows:
         try:
-            await context.bot.send_message(chat_id=chat_id, text=donation_message)
+            # Utilisez le bot directement comme dans check_addresses
+            await bot.send_message(chat_id=chat_id, text=donation_message)
         except Forbidden as e:
             logger.error("Bot blocked or chat deleted for chat %s when sending monthly donation summary: %s", chat_id, e)
             await remove_chat(chat_id)
