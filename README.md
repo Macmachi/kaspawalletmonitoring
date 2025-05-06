@@ -1,10 +1,11 @@
-# Kaspa Wallet Monitoring (Telegram Bot) 🤖 
+# Kaspa Wallet Monitoring (Telegram Bot) 🤖
+
 This project implements a **Telegram bot** that monitors Kaspa addresses by interfacing with a dedicated API. The bot checks for new transactions and balance changes for each registered Kaspa address and provides notifications directly via Telegram. Users can also manage their monitored addresses with simple bot commands.
 
 🔗 My bot is available on Telegram: @kaspawalletmonitor_bot
 
 ### What's New in v1.0.3
-- ⛏️ **Mining Rewards Detection**
+- ⛏️ **Mining Rewards Detection**  
   The bot now properly identifies and reports COINBASE transactions (mining rewards) with specific notification formatting.
 
 ### What's New in v1.0.2
@@ -17,7 +18,7 @@ This project implements a **Telegram bot** that monitors Kaspa addresses by inte
 
 - 📊 **Database Initialization**  
   Uses `aiosqlite` to manage a SQLite database with several tables:
-  - **chats**: Registers ID chats with their registration date and the total number of messages received.
+  - **chats**: Registers chat IDs with their registration date and the total number of messages received.
   - **kaspa_addresses**: Stores monitored Kaspa addresses for each chat, along with their addition date and the last known transaction count.
   - **daily_messages**: Logs the number of messages per chat on a daily basis.
   - **command_usage**: Tracks command usage per chat.
@@ -26,23 +27,28 @@ This project implements a **Telegram bot** that monitors Kaspa addresses by inte
 
 - 🎮 **Bot Commands**  
   The bot provides several commands for an intuitive user experience:
-  - `/start` – Registers the chat and displays the list of available commands.
-  - `/wallet <kaspa_address>` – Adds a Kaspa address to monitor after validating the address format and confirming it has at least one completed transaction.
-  - `/myaddresses` – Lists the monitored addresses for the chat and offers a delete option for each.
-  - `/donation` – Displays the donation address and shows the total amount of Kas received.
-  - `/help` – Provides help on how to use the bot.
+  - `/start` - Registers the chat and displays the list of available commands.
+  - `/wallet <kaspa_address>` - Adds a Kaspa address to monitor after validating the address format and confirming it has at least one completed transaction.
+  - `/myaddresses` - Lists the monitored addresses for the chat and offers a delete option for each.
+  - `/donation` - Displays the donation address and shows the total amount of Kas received.
+  - `/help` - Provides help on how to use the bot.
 
 - ⚡ **Real-Time Monitoring and Notifications**  
   - Uses `APScheduler` to schedule asynchronous tasks.
-  - Checks monitored addresses every minute for any new transactions.
+  - Checks monitored addresses every 30 seconds for any new transactions.
   - Sends an alert message when a balance change is detected, including details such as:
     - Previous and new balances.
     - The percentage change.
     - The amount sent or received.
     - Additional details such as sender or recipient information.
+    - Special formatting for mining rewards.
 
 - 📈 **Monthly Donation Summary**  
   Once a month, the bot compiles and sends a summary message of donation transactions (both sent and received) to all registered chats.
+
+- 💱 **Real-Time Price Updates**
+  - Uses the CoinMarketCap API to obtain the current price of Kaspa in USD.
+  - Updates the price every 15 minutes to ensure accurate conversions.
 
 ## 🛠️ Prerequisites and Installation
 
@@ -51,6 +57,7 @@ This project implements a **Telegram bot** that monitors Kaspa addresses by inte
 - 🐍 Python 3.12 or higher
 - 🔑 A Telegram API key (BOT_TOKEN) obtained from [BotFather](https://core.telegram.org/bots#botfather)
 - 🌐 Kaspa API URL and a donation address
+- 💹 CoinMarketCap API key for price conversions
 
 ### 📦 Installing Dependencies
 
@@ -130,12 +137,16 @@ The bot uses a SQLite database (`bot_database.db`) with the following tables:
 ## ⏰ Scheduled Tasks
 
 - 🔍 **Address Check (`check_addresses`)**  
-  Runs every minute to:
+  Runs every 30 seconds to:
   - Verify the number of transactions for each monitored address.
   - Update the balance history and send alerts if a balance change is detected.
+  - Format notifications differently based on transaction type (sending, receiving, mining).
 
 - 📅 **Monthly Donation Summary (`send_monthly_donation_message`)**  
   Runs on the first day of each month at midnight to compile and send a donation summary to all registered chats.
+
+- 💱 **Kaspa Price Update (`update_kaspa_price`)**  
+  Runs every 15 minutes to fetch the latest Kaspa price in USD via the CoinMarketCap API.
 
 ## 💖 Support the Project
 
