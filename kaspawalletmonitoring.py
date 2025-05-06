@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # Auteur : Rymentz
-# v1.0.5
+# v1.0.6
 
 import nest_asyncio
 nest_asyncio.apply()
@@ -10,10 +10,9 @@ from logging.handlers import TimedRotatingFileHandler
 logging.getLogger("httpx").setLevel(logging.WARNING)
 import re
 from datetime import datetime, timezone
-
 import aiohttp
 import aiosqlite
-import configparser  
+import configparser
 import os
 import sys
 
@@ -27,10 +26,15 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # --- READING THE CONFIG FILE ---
 config = configparser.ConfigParser()
-config.read("config.ini")
+# Make sure config.ini is in the same directory or specify the full path
+config_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.ini")
+if not os.path.exists(config_file_path):
+    print(f"Erreur: Le fichier de configuration '{config_file_path}' est introuvable.")
+    sys.exit(1)
+config.read(config_file_path)
 
 BOT_TOKEN = config.get("telegram", "BOT_TOKEN")
-KASPA_API_URL = config.get("kaspa", "KASPA_API_URL")
+KASPA_API_URL = config.get("kaspa", "KASPA_API_URL") # e.g., https://api.kaspa.org
 DONATION_ADDRESS = config.get("kaspa", "DONATION_ADDRESS")
 CMC_API_KEY = config.get("coinmarketcap", "API_KEY")
 KASPA_CMC_ID = config.get("coinmarketcap", "KASPA_ID")
@@ -39,90 +43,94 @@ log_dir = "logs"
 if not os.path.exists(log_dir):
     os.makedirs(log_dir)
 
-# Create a handler that rotates the logs weekly and keeps 6 files (6 weeks)
 log_file = os.path.join(log_dir, "bot.log")
 file_handler = TimedRotatingFileHandler(
     log_file,
-    when="W0",     # every monday at midnight
+    when="W0",
     interval=1,
     backupCount=6
 )
 formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 file_handler.setFormatter(formatter)
 
-# Configure the root logger to write directly to the file.
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[file_handler]
+    # Adding StreamHandler for console output
+    handlers=[file_handler, logging.StreamHandler(sys.stdout)] 
 )
 
-# Définition du logger
 logger = logging.getLogger(__name__)
 
-# Put print in log file
 class LoggerWriter:
-    def __init__(self, level):
+    def __init__(self, logger_instance, level):
+        self.logger_instance = logger_instance
         self.level = level
     def write(self, message):
         message = message.strip()
         if message:
-            self.level(message)
+            self.logger_instance.log(self.level, message)
     def flush(self):
         pass
 
-sys.stdout = LoggerWriter(logging.getLogger(__name__).info)
-sys.stderr = LoggerWriter(logging.getLogger(__name__).error)
+sys.stdout = LoggerWriter(logger, logging.INFO)
+sys.stderr = LoggerWriter(logger, logging.ERROR)
 
-# Global variable for the database connection
 db_conn = None
-# Global variable for Kaspa price
 current_kaspa_price = 0.0
-# To verify if transaction is accepted or not (timelaps of 2 minutes)
-pending_transactions = {}  # Format: {tx_id: {'address': address, 'first_seen': timestamp, 'chat_id': chat_id, ...}}
-TRANSACTION_TIMEOUT = 300  # 5 minutes in seconds
-MAX_RETRY_ATTEMPTS = 6    # Maximum number of retry attempts for sending notifications
 
-# --- HELPER FUNCTION: fetch_with_retry ---
-async def fetch_with_retry(session: aiohttp.ClientSession, url: str, timeout: int = 10, retries: int = 3):
+# --- HELPER FUNCTION: fetch_with_retry (for GET requests) ---
+async def fetch_with_retry(session: aiohttp.ClientSession, url: str, timeout: int = 10, retries: int = 3, is_json=True):
     for attempt in range(retries):
         try:
             async with session.get(url, timeout=timeout) as response:
                 if response.status == 200:
-                    return await response.json()
+                    return await response.json() if is_json else await response.text()
                 else:
-                    logger.error("API call to %s returned status %s", url, response.status)
+                    logger.error(f"API GET call to {url} returned status {response.status}. Response: {await response.text()}")
                     return None
-        except asyncio.TimeoutError as te:
-            logger.warning("Timeout on attempt %d for url: %s", attempt + 1, url)
-            await asyncio.sleep(2 ** attempt)  # exponential backoff
+        except asyncio.TimeoutError:
+            logger.warning(f"Timeout on GET attempt {attempt + 1} for url: {url}")
+            await asyncio.sleep(2 ** attempt)
+        except aiohttp.ClientError as e: # More specific for network errors
+            logger.error(f"ClientError fetching data from {url} on attempt {attempt + 1}: {e}")
+            await asyncio.sleep(2 ** attempt)
         except Exception as e:
-            logger.error("Error fetching data from %s: %s", url, e)
+            logger.error(f"Generic error fetching data from {url} on attempt {attempt + 1}: {e}")
+            break # Break on unknown errors
+    return None
+
+# --- HELPER FUNCTION: post_with_retry (for POST requests) ---
+async def post_with_retry(session: aiohttp.ClientSession, url: str, payload: dict, timeout: int = 10, retries: int = 3, is_json=True):
+    for attempt in range(retries):
+        try:
+            async with session.post(url, json=payload, timeout=timeout) as response:
+                if response.status == 200:
+                    return await response.json() if is_json else await response.text()
+                else:
+                    logger.error(f"API POST call to {url} with payload {payload} returned status {response.status}. Response: {await response.text()}")
+                    return None
+        except asyncio.TimeoutError:
+            logger.warning(f"Timeout on POST attempt {attempt + 1} for url: {url}")
+            await asyncio.sleep(2 ** attempt)
+        except aiohttp.ClientError as e:
+            logger.error(f"ClientError posting data to {url} on attempt {attempt + 1}: {e}")
+            await asyncio.sleep(2 ** attempt)
+        except Exception as e:
+            logger.error(f"Generic error posting data to {url} on attempt {attempt + 1}: {e}")
             break
     return None
 
-# --- GLOBAL ERROR HANDLER ---
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Global error handler to capture exceptions."""
     logger.error("Exception occurred: %s", context.error, exc_info=context.error)
-    # Optionally notify the user if possible
     if update and hasattr(update, "effective_message") and update.effective_message:
         try:
             await update.effective_message.reply_text("An unexpected error occurred. Please try again later.")
         except Exception as e:
             logger.error("Failed to send error message: %s", e)
 
-# --- INITIALIZING THE DATABASE ---
 async def init_db():
-    """
-    Initializes the aiosqlite database and creates the necessary tables:
-      - chats: Chat ID, registration date, and total number of messages sent.
-      - kaspa_addresses: Kaspa addresses monitored per chat with addition date and known transaction count.
-      - daily_messages: Number of messages sent per chat per date.
-      - command_usage: Command usage per chat.
-      - balance_history: Balance history for each address (in Kas).
-      - donations: Records donations with sender/recipient, amount, etc.
-    """
     conn = await aiosqlite.connect("bot_database.db")
     await conn.execute(
         """
@@ -173,12 +181,11 @@ async def init_db():
             chat_id INTEGER,
             address TEXT,
             record_date TEXT,
-            balance REAL,
+            balance REAL, -- Stored in Kas
             FOREIGN KEY(chat_id) REFERENCES chats(chat_id)
         )
         """
     )
-    # Table to record donation transactions
     await conn.execute(
         """
         CREATE TABLE IF NOT EXISTS donations (
@@ -194,7 +201,6 @@ async def init_db():
     await conn.commit()
     return conn
 
-# --- STATISTICS FUNCTIONS ---
 async def increment_message_count(chat_id: int):
     try:
         await db_conn.execute(
@@ -255,14 +261,7 @@ async def record_message(chat_id: int, command: str = None):
     if command:
         await update_command_usage(chat_id, command)
 
-# --- FUNCTION TO RECORD A DONATION TRANSACTION ---
 async def record_donation_transaction(transaction_id: str, sender_address: str, recipient_address: str, amount: float):
-    """
-    Records a donation transaction in the donations table.
-    Depending on the direction of the transaction (sent or received),
-    the non-DONATION_ADDRESS field will contain either the sender's address (donation received)
-    or the recipient's address (donation sent).
-    """
     record_date = datetime.now(timezone.utc).isoformat()
     await db_conn.execute(
         "INSERT INTO donations (transaction_id, sender_address, recipient_address, amount, record_date) VALUES (?,?,?,?,?)",
@@ -270,12 +269,7 @@ async def record_donation_transaction(transaction_id: str, sender_address: str, 
     )
     await db_conn.commit()
 
-# --- FUNCTION TO REMOVE A CHAT ---
 async def remove_chat(chat_id: int):
-    """
-    Deletes all entries (chats, kaspa_addresses, daily_messages, command_usage, balance_history)
-    associated with a given chat.
-    """
     try:
         await db_conn.execute("DELETE FROM chats WHERE chat_id = ?", (chat_id,))
         await db_conn.execute("DELETE FROM kaspa_addresses WHERE chat_id = ?", (chat_id,))
@@ -287,17 +281,11 @@ async def remove_chat(chat_id: int):
     except Exception as e:
         logger.error("Error removing chat %s: %s", chat_id, e)
 
-# --- BOT COMMANDS ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    /start
-    Registers the chat if not already registered and shows the list of available commands.
-    """
     chat_id = update.effective_chat.id
     async with db_conn.execute("SELECT chat_id FROM chats WHERE chat_id = ?", (chat_id,)) as cursor:
         row = await cursor.fetchone()
     if row:
-        # Chat is already registered, so log the command and send an updated message.
         await record_message(chat_id, "start")
         start_message = (
             "Hey, the bot is already running in this chat! 😊\n\n"
@@ -311,7 +299,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(start_message)
         return
     else:
-        # Initial registration
         start_date = datetime.now(timezone.utc).isoformat()
         await db_conn.execute(
             "INSERT INTO chats (chat_id, start_date, messages_count) VALUES (?,?,?)",
@@ -331,12 +318,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(start_message)
 
 async def add_address(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    /wallet <kaspa_address>
-    - Validates the address format.
-    - Uses the Kaspa API to ensure that it has completed at least one transaction.
-    - Registers the address for the chat if it does not already exist and creates an initial record in the history.
-    """
     chat_id = update.effective_chat.id
     await record_message(chat_id, "wallet")
     args = context.args
@@ -349,46 +330,54 @@ async def add_address(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text("The Kaspa address format is incorrect. 😕")
         return
 
-    headers = {"Accept": "application/json"}
-    count_url = f"{KASPA_API_URL}/addresses/{address}/transactions-count"
+    headers = {"Accept": "application/json", "Content-Type": "application/json"}
     async with aiohttp.ClientSession(headers=headers) as session:
-        data = await fetch_with_retry(session, count_url, timeout=10, retries=3)
-        if data is None:
-            await update.message.reply_text("Error verifying the address (API timeout or error). 😢")
+        # Check if address has transactions
+        count_url = f"{KASPA_API_URL}/addresses/{address}/transactions-count"
+        data_count = await fetch_with_retry(session, count_url)
+        if data_count is None:
+            await update.message.reply_text("Error verifying the address (API timeout or error for tx count). 😢")
+            return
+        if data_count.get("limit_exceeded", False):
+            logger.warning("Transaction count limit exceeded for address %s", address)
+        if not data_count.get("total", 0):
+            await update.message.reply_text("This address hasn't made any transactions yet. 😕")
             return
 
-    if data.get("limit_exceeded", False):
-        logger.warning("Transaction count limit exceeded for address %s", address)
+        async with db_conn.execute(
+            "SELECT id FROM kaspa_addresses WHERE chat_id = ? AND address = ?",
+            (chat_id, address)
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row:
+            await update.message.reply_text("This address is already registered! 😉")
+            return
 
-    if not data.get("total", 0):
-        await update.message.reply_text("This address hasn't made any transactions yet. 😕")
-        return
+        added_date = datetime.now(timezone.utc).isoformat()
+        await db_conn.execute(
+            "INSERT INTO kaspa_addresses (chat_id, address, added_date, last_tx_count) VALUES (?,?,?,?)",
+            (chat_id, address, added_date, 0) # Initial last_tx_count is 0
+        )
+        await db_conn.commit()
 
-    async with db_conn.execute(
-        "SELECT id FROM kaspa_addresses WHERE chat_id = ? AND address = ?",
-        (chat_id, address)
-    ) as cursor:
-        row = await cursor.fetchone()
-    if row:
-        await update.message.reply_text("This address is already registered! 😉")
-        return
+        # Retrieve initial balance using the new /addresses/balances endpoint
+        balance_payload = {"addresses": [address]}
+        balance_api_endpoint = f"{KASPA_API_URL}/addresses/balances"
+        balance_data_list = await post_with_retry(session, balance_api_endpoint, payload=balance_payload)
 
-    added_date = datetime.now(timezone.utc).isoformat()
-    await db_conn.execute(
-        "INSERT INTO kaspa_addresses (chat_id, address, added_date, last_tx_count) VALUES (?,?,?,?)",
-        (chat_id, address, added_date, 0)
-    )
-    await db_conn.commit()
-
-    # Retrieve the initial balance and store it in the history.
-    async with aiohttp.ClientSession(headers=headers) as session:
-        balance_url = f"{KASPA_API_URL}/addresses/{address}/balance"
-        data_balance = await fetch_with_retry(session, balance_url, timeout=10, retries=3)
-        if data_balance is None:
+        kas_value = 0
+        if balance_data_list and isinstance(balance_data_list, list) and len(balance_data_list) > 0:
+            balance_info = balance_data_list[0]
+            if balance_info.get("address") == address:
+                balance_sompi = balance_info.get("balance", 0)
+                kas_value = balance_sompi / 100_000_000
+            else:
+                await update.message.reply_text("Error: API returned balance for a different address. 😢")
+                return
+        else:
             await update.message.reply_text("Error retrieving the balance for the address. 😢")
+            # Potentially rollback the address insertion or handle this state
             return
-        balance = data_balance.get("balance", 0)
-        kas_value = balance / 100_000_000
 
     current_time = datetime.now(timezone.utc).isoformat()
     await db_conn.execute(
@@ -397,15 +386,12 @@ async def add_address(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
     await db_conn.commit()
 
-    await update.message.reply_text(f"Awesome! 😄 Address {address} registered successfully!")
+    await update.message.reply_text(f"Awesome! 😄 Address {address} registered successfully with balance {kas_value:.8f} KAS!")
+
 
 async def myaddresses(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    /myaddresses
-    Displays a list of addresses monitored by the user with a "Delete" button for each.
-    """
     chat_id = update.effective_chat.id
-
+    await record_message(chat_id, "myaddresses")
     async with db_conn.execute(
         "SELECT id, address, added_date FROM kaspa_addresses WHERE chat_id = ?",
         (chat_id,)
@@ -426,10 +412,6 @@ async def myaddresses(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await update.message.reply_text(reply_text, reply_markup=reply_markup)
 
 async def delete_address_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Callback for deleting an address via the inline "Delete" button.
-    Ensures that the entry belongs to the user.
-    """
     query = update.callback_query
     await query.answer()
     data = query.data
@@ -444,49 +426,58 @@ async def delete_address_callback(update: Update, context: ContextTypes.DEFAULT_
 
     chat_id = update.effective_chat.id
     async with db_conn.execute(
-        "SELECT id FROM kaspa_addresses WHERE id = ? AND chat_id = ?",
+        "SELECT address FROM kaspa_addresses WHERE id = ? AND chat_id = ?", # Get address for logging
         (record_id, chat_id)
     ) as cursor:
         row = await cursor.fetchone()
     if not row:
         await query.edit_message_text("Sorry, you cannot delete this address. 😕")
         return
+    
+    address_to_delete = row[0]
 
     await db_conn.execute(
         "DELETE FROM kaspa_addresses WHERE id = ? AND chat_id = ?",
         (record_id, chat_id)
     )
+    # Also delete from balance_history
+    await db_conn.execute(
+        "DELETE FROM balance_history WHERE address = ? AND chat_id = ?",
+        (address_to_delete, chat_id)
+    )
     await db_conn.commit()
-    await query.edit_message_text("Address deleted successfully! 👍")
+    await query.edit_message_text(f"Address {address_to_delete} deleted successfully! 👍")
+
 
 async def donation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    /donation
-    Displays the donation address and the total Kas received.
-    """
-    headers = {"Accept": "application/json"}
-    url = f"{KASPA_API_URL}/addresses/{DONATION_ADDRESS}/balance"
-    async with aiohttp.ClientSession(headers=headers) as session:
-        data = await fetch_with_retry(session, url, timeout=10, retries=3)
-        if data is None:
-            await update.message.reply_text("Oops, error retrieving donation data (API). 😢")
-            return
-
-    balance = data.get("balance", 0)
-    kas_value = balance / 100_000_000
-    smiley = "😊" if kas_value > 0 else "😕"
-    donation_message = (
-        f"Donation address: {DONATION_ADDRESS}\n"
-        f"Total Kas received: {kas_value} Kas {smiley}"
-    )
+    chat_id = update.effective_chat.id
+    await record_message(chat_id, "donation")
+    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+    balance_payload = {"addresses": [DONATION_ADDRESS]}
+    balance_api_endpoint = f"{KASPA_API_URL}/addresses/balances"
     
-    await update.message.reply_text(donation_message)
+    async with aiohttp.ClientSession(headers=headers) as session:
+        balance_data_list = await post_with_retry(session, balance_api_endpoint, payload=balance_payload)
+
+        if balance_data_list and isinstance(balance_data_list, list) and len(balance_data_list) > 0:
+            balance_info = balance_data_list[0]
+            if balance_info.get("address") == DONATION_ADDRESS:
+                balance_sompi = balance_info.get("balance", 0)
+                kas_value = balance_sompi / 100_000_000
+                smiley = "😊" if kas_value > 0 else "😕"
+                donation_message = (
+                    f"Donation address: {DONATION_ADDRESS}\n"
+                    f"Total Kas received: {kas_value:.2f} Kas {smiley}"
+                )
+                await update.message.reply_text(donation_message)
+            else:
+                await update.message.reply_text("Oops, error retrieving donation data (API address mismatch). 😢")
+        else:
+            await update.message.reply_text("Oops, error retrieving donation data (API). 😢")
 
 async def aide(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    /help
-    Displays instructions for using the bot.
-    """
+    chat_id = update.effective_chat.id
+    await record_message(chat_id, "help")
     help_text = (
         "Hello! 👋 Welcome to the Kaspa Wallet Monitor Help. Here are the available commands:\n\n"
         "/start - Register your chat and initialize your monitoring 😊\n"
@@ -499,296 +490,205 @@ async def aide(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
     await update.message.reply_text(help_text)
 
-# --- CHECK ADDRESSES FUNCTION ---
+# --- OPTIMIZED CHECK ADDRESSES FUNCTION ---
 async def check_addresses(bot) -> None:
-    """
-    Checks every minute for each monitored address for new transactions.
-    If a new transaction is detected, it updates the transaction counter,
-    records the new balance, and sends an alert message only if the balance changed.
-    Transactions that are not yet accepted are placed in a waiting queue and checked
-    on each run until they are either accepted or reach the 5-minute timeout.
-    Failed notifications will be retried up to 3 times.
-    """
-    global pending_transactions
-    current_time = datetime.now(timezone.utc)
+    # 1. Group addresses by their value to avoid duplicates
+    address_to_chats = {}  # Maps addresses to list of (chat_id, record_id, last_tx_count)
     
     async with db_conn.execute("SELECT id, chat_id, address, last_tx_count FROM kaspa_addresses") as cursor:
         rows = await cursor.fetchall()
-    headers = {"Accept": "application/json"}
+    
+    for record_id, chat_id, address, last_tx_count in rows:
+        if address not in address_to_chats:
+            address_to_chats[address] = []
+        address_to_chats[address].append((chat_id, record_id, last_tx_count))
+    
+    if not address_to_chats:  # No addresses to check
+        return
+    
+    headers = {"Accept": "application/json", "Content-Type": "application/json"}
     
     async with aiohttp.ClientSession(headers=headers) as session:
-        for record_id, chat_id, address, last_tx in rows:
-            # Retrieve the count of transactions for the address
-            tx_count_url = f"{KASPA_API_URL}/addresses/{address}/transactions-count"
-            data = await fetch_with_retry(session, tx_count_url, timeout=10, retries=3)
-            if data is None:
-                continue
-            new_tx_count = data.get("total", 0)
-            if new_tx_count > last_tx:
-                # Update the transaction counter in the database
-                await db_conn.execute(
-                    "UPDATE kaspa_addresses SET last_tx_count = ? WHERE id = ?",
-                    (new_tx_count, record_id)
-                )
-                await db_conn.commit()
+        # 2. Check each unique address only once
+        for address, chat_records in address_to_chats.items():
+            # Get current balance from API
+            balance_payload = {"addresses": [address]}
+            balance_api_endpoint = f"{KASPA_API_URL}/addresses/balances"
+            api_balance_kas = 0
+            valid_balance_fetched = False
 
-                # Retrieve the previous balance from the history
+            balance_data_list = await post_with_retry(session, balance_api_endpoint, payload=balance_payload)
+            if balance_data_list and isinstance(balance_data_list, list) and len(balance_data_list) > 0:
+                balance_info = balance_data_list[0]
+                if balance_info.get("address") == address:
+                    balance_sompi = balance_info.get("balance", 0)
+                    api_balance_kas = balance_sompi / 100_000_000
+                    valid_balance_fetched = True
+                else:
+                    logger.warning(f"Balance API returned data for wrong address. Expected {address}, got {balance_info.get('address')}")
+            else:
+                logger.error(f"Failed to fetch balance for {address} or empty/invalid response: {balance_data_list}")
+            
+            if not valid_balance_fetched:
+                continue  # Skip this address if balance couldn't be fetched
+
+            # Get transaction count (once per address)
+            tx_count_url = f"{KASPA_API_URL}/addresses/{address}/transactions-count"
+            tx_count_data = await fetch_with_retry(session, tx_count_url)
+            new_api_tx_count = 0  # Default
+            if tx_count_data and tx_count_data.get("total") is not None:
+                new_api_tx_count = tx_count_data.get("total", 0)
+            
+            # Track if we need to fetch transaction details
+            any_balance_changed = False
+            chats_with_balance_change = []
+            
+            # Process each chat that monitors this address
+            for chat_id, record_id, last_tx_db_count in chat_records:
+                # Get previous balance from DB history
                 async with db_conn.execute(
                     "SELECT balance FROM balance_history WHERE chat_id = ? AND address = ? ORDER BY record_date DESC LIMIT 1",
                     (chat_id, address)
-                ) as cursor2:
-                    res = await cursor2.fetchone()
-                old_balance = res[0] if res else 0
-
-                # Retrieve the new balance via the API
-                balance_url = f"{KASPA_API_URL}/addresses/{address}/balance"
-                data_balance = await fetch_with_retry(session, balance_url, timeout=10, retries=3)
-                if data_balance is None:
-                    continue
-                balance = data_balance.get("balance", 0)
-                kas_value = balance / 100_000_000
-
-                # If the balance hasn't changed, do nothing
-                if kas_value == old_balance:
-                    logger.info("Transaction detected for address %s but balance hasn't changed.", address)
-                    continue
-
-                # Calculate the difference and percentage change
-                if old_balance > 0:
-                    difference = kas_value - old_balance
-                    percentage_change = (difference / old_balance) * 100
-                else:
-                    difference = kas_value
-                    percentage_change = 100
-
-                direction = "📥 Received" if difference > 0 else "📤 Sent"
-
-                # Convert the transaction amount from Kaspa to USD
-                usd_amount = abs(difference) * current_kaspa_price
-
-                # Use the API to retrieve the most recent transaction via full-transactions-page
-                tx_page_url = f"{KASPA_API_URL}/addresses/{address}/full-transactions-page?limit=1"
-                tx_data = await fetch_with_retry(session, tx_page_url, timeout=10, retries=3)
-                tx_id = None
-                is_coinbase = False
-                is_accepted = False
+                ) as cursor_prev_balance:
+                    res_prev_balance = await cursor_prev_balance.fetchone()
                 
-                if tx_data and isinstance(tx_data, list) and len(tx_data) > 0:
-                    tx = tx_data[0]
-                    tx_id = tx.get("transaction_id")
-                    
-                    # Check if the transaction is accepted
-                    is_accepted = tx.get("acceptingBlock") is not None
-                    
-                    # Check if this is a coinbase (mining) transaction
-                    if direction == "📥 Received":  # Only check for incoming transactions
-                        # Method 1: Check if inputs are empty or have specific flags
-                        if not tx.get("inputs") or any(inp.get("is_coinbase", False) for inp in tx.get("inputs", [])):
-                            is_coinbase = True
-                        # Method 2: Try to identify by checking input structure
-                        elif len(tx.get("inputs", [])) == 0 and len(tx.get("outputs", [])) > 0:
-                            is_coinbase = True
+                db_old_balance_kas = res_prev_balance[0] if res_prev_balance else 0  # Default to 0 if no history
                 
-                # If the transaction is not accepted, put it in the waiting queue
-                if tx_id and not is_accepted:
-                    if tx_id not in pending_transactions:
-                        # First time we see this transaction, put it in the waiting queue
-                        pending_transactions[tx_id] = {
-                            'address': address,
-                            'chat_id': chat_id,
-                            'first_seen': current_time,
-                            'old_balance': old_balance,
-                            'new_balance': kas_value,
-                            'difference': difference,
-                            'percentage_change': percentage_change,
-                            'direction': direction,
-                            'usd_amount': usd_amount,
-                            'is_coinbase': is_coinbase,
-                            'link': f"https://explorer.kaspa.org/txs/{tx_id}" if tx_id else f"https://explorer.kaspa.org/addresses/{address}?page=1",
-                            'target_info': "",      # Will be filled later if needed
-                            'send_attempts': 0      # Initialize retry counter
-                        }
-                        
-                        # Build target_info for the pending transaction
-                        if tx_data and isinstance(tx_data, list) and len(tx_data) > 0:
-                            tx = tx_data[0]
-                            if is_coinbase:
-                                pending_transactions[tx_id]['target_info'] = "\nFrom: COINBASE (New coins) 🎉"
-                            elif difference > 0:
-                                # Regular incoming transaction
-                                sender = None
-                                for inp in tx.get("inputs", []):
-                                    candidate = inp.get("previous_outpoint_address")
-                                    if not candidate and inp.get("previous_outpoint_resolved"):
-                                        candidate = inp["previous_outpoint_resolved"].get("script_public_key_address")
-                                    if candidate and candidate != address:
-                                        sender = candidate
-                                        break
-                                pending_transactions[tx_id]['target_info'] = f"\nFrom: {sender}" if sender else ""
-                            else:
-                                # Outgoing transaction
-                                recipient = None
-                                for out in tx.get("outputs", []):
-                                    candidate = out.get("script_public_key_address")
-                                    if candidate and candidate != address:
-                                        recipient = candidate
-                                        break
-                                pending_transactions[tx_id]['target_info'] = f"\nTo: {recipient}" if recipient else ""
-                                
-                        logger.info(f"Transaction {tx_id} not accepted, added to waiting queue for address {address}")
-                    continue  # Skip further processing for this transaction
+                # Check if balance has changed significantly
+                balance_changed = abs(api_balance_kas - db_old_balance_kas) > 1e-9
                 
-                # Process accepted transaction that wasn't in the pending queue
-                # Build the link: if tx_id is available, redirect to the transaction; otherwise, to the address page
-                if tx_id:
-                    link = f"https://explorer.kaspa.org/txs/{tx_id}"
-                else:
-                    link = f"https://explorer.kaspa.org/addresses/{address}?page=1"
-
-                # Handle transaction details based on transaction type
-                target_info = ""
-                if tx_data and isinstance(tx_data, list) and len(tx_data) > 0:
-                    tx = tx_data[0]
-                    if is_coinbase:
-                        # This is a mining reward transaction
-                        target_info = "\nFrom: COINBASE (New coins) 🎉"
-                    elif difference > 0:
-                        # Regular incoming transaction
-                        sender = None
-                        for inp in tx.get("inputs", []):
-                            candidate = inp.get("previous_outpoint_address")
-                            if not candidate and inp.get("previous_outpoint_resolved"):
-                                candidate = inp["previous_outpoint_resolved"].get("script_public_key_address")
-                            if candidate and candidate != address:
-                                sender = candidate
-                                break
-                        target_info = f"\nFrom: {sender}" if sender else ""
-                    else:
-                        # Outgoing transaction
-                        recipient = None
-                        for out in tx.get("outputs", []):
-                            candidate = out.get("script_public_key_address")
-                            if candidate and candidate != address:
-                                recipient = candidate
-                                break
-                        target_info = f"\nTo: {recipient}" if recipient else ""
-
-                # Record the new balance in the history
+                # Update balance_history regardless of change
                 current_time_iso = datetime.now(timezone.utc).isoformat()
                 await db_conn.execute(
                     "INSERT INTO balance_history (chat_id, address, record_date, balance) VALUES (?,?,?,?)",
-                    (chat_id, address, current_time_iso, kas_value)
-                )
-                await db_conn.commit()
-
-                # Customize message for coinbase transactions
-                tx_type = "mining reward" if is_coinbase else "transaction"
-
-                # Construct and send the alert message  
-                alert_message = (
-                    f"🎉 New {tx_type} detected for address: "
-                    f"<a href='{link}'>{address}</a>\n"
-                    f"🔴 Previous balance: {old_balance:.2f} Kas\n"
-                    f"🟢 New balance: {kas_value:.2f} Kas\n"
-                    f"🔄 Change: {percentage_change:.2f}% compared to the previous balance.\n"
-                    f"💸 Amount {direction}: {difference:+.2f} Kas (~{usd_amount:.2f} USD)"
-                    f"{target_info}"
+                    (chat_id, address, current_time_iso, api_balance_kas)
                 )
                 
-                try:
-                    await bot.send_message(chat_id=chat_id, text=alert_message, parse_mode='HTML')
-                except Forbidden as e:
-                    logger.error("Bot blocked or chat deleted for chat %s when sending alert: %s", chat_id, e)
-                    await remove_chat(chat_id)
-                except Exception as e:
-                    logger.error("Error sending alert for %s to chat %s: %s", address, chat_id, e)
-        
-        # Check all pending transactions on each run
-        pending_tx_to_check = list(pending_transactions.items())
-        for tx_id, tx_info in pending_tx_to_check:
-            # Check the transaction status again
-            tx_data_url = f"{KASPA_API_URL}/transactions/{tx_id}"
-            tx_data = await fetch_with_retry(session, tx_data_url, timeout=10, retries=3)
+                # Update last_tx_count in DB if it changed
+                if new_api_tx_count != last_tx_db_count:
+                    await db_conn.execute(
+                        "UPDATE kaspa_addresses SET last_tx_count = ? WHERE id = ?",
+                        (new_api_tx_count, record_id)
+                    )
+                
+                # If balance changed, add this chat to our list for alerts
+                if balance_changed:
+                    any_balance_changed = True
+                    chats_with_balance_change.append((chat_id, db_old_balance_kas))
             
-            if tx_data:
-                is_accepted = tx_data.get("acceptingBlock") is not None
+            # Commit all database updates for this address
+            await db_conn.commit()
+            
+            # If no balance changes for any chat, skip alert processing
+            if not any_balance_changed:
+                continue
+            
+            # Only fetch transaction details if there's at least one chat with a balance change
+            tx_details = None
+            tx_link_explorer = f"https://explorer.kaspa.org/addresses/{address}"
+            
+            # Fetch the latest transaction details for the alerts
+            latest_tx_url = f"{KASPA_API_URL}/addresses/{address}/full-transactions?limit=1&offset=0&resolve_previous_outpoints=full"
+            latest_tx_data_list = await fetch_with_retry(session, latest_tx_url)
+            
+            if latest_tx_data_list and isinstance(latest_tx_data_list, list) and len(latest_tx_data_list) > 0:
+                tx_details = latest_tx_data_list[0]
+                tx_id = tx_details.get("transaction_id")
+                if tx_id:
+                    tx_link_explorer = f"https://explorer.kaspa.org/txs/{tx_id}"
+            
+            # Send alerts to each chat with a balance change
+            for chat_id, db_old_balance_kas in chats_with_balance_change:
+                difference_kas = api_balance_kas - db_old_balance_kas
+                alert_message_text = ""
                 
-                # If the transaction is now accepted, send notification
-                if is_accepted:
-                    address = tx_info['address']
-                    chat_id = tx_info['chat_id']
-                    old_balance = tx_info['old_balance']
-                    kas_value = tx_info['new_balance']
-                    difference = tx_info['difference']
-                    percentage_change = tx_info['percentage_change']
-                    direction = tx_info['direction']
-                    usd_amount = tx_info['usd_amount']
-                    is_coinbase = tx_info['is_coinbase']
-                    link = tx_info['link']
-                    target_info = tx_info['target_info']
-                    send_attempts = tx_info.get('send_attempts', 0)
+                if tx_details:
+                    subnetwork_id = tx_details.get("subnetwork_id", "00")
+                    is_accepted = tx_details.get("is_accepted", False)
                     
-                    # Only try to send if we haven't reached the maximum retry attempts
-                    if send_attempts < MAX_RETRY_ATTEMPTS:
-                        # Record the new balance in the history if not already done
-                        current_time_iso = datetime.now(timezone.utc).isoformat()
-                        await db_conn.execute(
-                            "INSERT INTO balance_history (chat_id, address, record_date, balance) VALUES (?,?,?,?)",
-                            (chat_id, address, current_time_iso, kas_value)
-                        )
-                        await db_conn.commit()
+                    usd_amount = abs(difference_kas) * current_kaspa_price
+                    
+                    if subnetwork_id.startswith("01"):  # Mining transaction
+                        if is_accepted:
+                            alert_message_text = (
+                                f"⛏️ Mining Reward Accepted for: <a href='{tx_link_explorer}'>{address}</a>\n"
+                                f"💰 Amount: +{abs(difference_kas):.2f} Kas (~${usd_amount:.2f} USD)\n"
+                                f"🔴 Previous balance: {db_old_balance_kas:.2f} Kas\n"
+                                f"🟢 New balance: {api_balance_kas:.2f} Kas"
+                            )
+                        else:
+                            logger.info(f"Mining transaction {tx_id or 'N/A'} for {address} is not accepted. No alert sent.")
+                            continue  # Skip alert for not-accepted mining transactions
+                    else:  # Regular transaction
+                        direction = "📥 Received" if difference_kas > 0 else "📤 Sent"
+                        percentage_change_info = ""
+                        if abs(db_old_balance_kas) > 1e-9:
+                            percentage_change = (difference_kas / db_old_balance_kas) * 100
+                            percentage_change_info = f"\n🔄 Change: {percentage_change:+.2f}%"
+                        else:
+                            percentage_change_info = "\n🔄 New funds received!" if difference_kas > 0 else ""
                         
-                        # Customize message for coinbase transactions
-                        tx_type = "mining reward" if is_coinbase else "transaction"
+                        target_info = ""
+                        # Simplified target info (first non-self input/output)
+                        if difference_kas > 0:  # Received
+                            sender = "Unknown Sender"
+                            if tx_details.get("inputs"):
+                                for inp in tx_details["inputs"]:
+                                    prev_addr = inp.get("previous_outpoint_address")
+                                    if prev_addr and prev_addr != address:
+                                        sender = prev_addr
+                                        break
+                            target_info = f"\nFrom: {sender}"
+                        else:  # Sent
+                            recipient = "Unknown Recipient"
+                            if tx_details.get("outputs"):
+                                for out in tx_details["outputs"]:
+                                    out_addr = out.get("script_public_key_address")
+                                    if out_addr and out_addr != address:
+                                        recipient = out_addr
+                                        break
+                            target_info = f"\nTo: {recipient}"
                         
-                        # Construct and send the alert message
-                        alert_message = (
-                            f"🎉 New {tx_type} detected for address: "
-                            f"<a href='{link}'>{address}</a>\n"
-                            f"🔴 Previous balance: {old_balance:.2f} Kas\n"
-                            f"🟢 New balance: {kas_value:.2f} Kas\n"
-                            f"🔄 Change: {percentage_change:.2f}% compared to the previous balance.\n"
-                            f"💸 Amount {direction}: {difference:+.2f} Kas (~{usd_amount:.2f} USD)"
+                        alert_message_text = (
+                            f"🎉 Transaction detected for: <a href='{tx_link_explorer}'>{address}</a>\n"
+                            f"🔴 Previous balance: {db_old_balance_kas:.2f} Kas\n"
+                            f"🟢 New balance: {api_balance_kas:.2f} Kas"
+                            f"{percentage_change_info}\n"
+                            f"💸 Amount {direction}: {difference_kas:+.2f} Kas (~${usd_amount:.2f} USD)"
                             f"{target_info}"
                         )
-                        
-                        try:
-                            await bot.send_message(chat_id=chat_id, text=alert_message, parse_mode='HTML')
-                            # Notification sent successfully, remove from pending queue
-                            del pending_transactions[tx_id]
-                            logger.info(f"Transaction {tx_id} is now accepted and notification sent successfully")
-                        except Forbidden as e:
-                            logger.error("Bot blocked or chat deleted for chat %s when sending alert: %s", chat_id, e)
-                            await remove_chat(chat_id)
-                            # Remove from pending transactions in case of Forbidden error
-                            del pending_transactions[tx_id]
-                        except Exception as e:
-                            # Increment the retry counter
-                            pending_transactions[tx_id]['send_attempts'] = send_attempts + 1
-                            logger.error(f"Error sending alert for {address} to chat {chat_id}: {e} (attempt {send_attempts + 1}/{MAX_RETRY_ATTEMPTS})")
-                            
-                            # If we've reached the maximum number of attempts, give up and remove from pending
-                            if send_attempts + 1 >= MAX_RETRY_ATTEMPTS:
-                                logger.warning(f"Maximum retry attempts ({MAX_RETRY_ATTEMPTS}) reached for transaction {tx_id}. Notification not sent.")
-                                del pending_transactions[tx_id]
-                    else:
-                        # We've already tried the maximum number of times, remove from pending
-                        logger.warning(f"Maximum retry attempts ({MAX_RETRY_ATTEMPTS}) reached for transaction {tx_id}. Notification not sent.")
-                        del pending_transactions[tx_id]
+                else:  # Fallback if transaction details couldn't be fetched
+                    direction = "📥 Received" if difference_kas > 0 else "📤 Sent"
+                    usd_amount = abs(difference_kas) * current_kaspa_price
+                    alert_message_text = (
+                        f"⚠️ Balance Change for: <a href='{tx_link_explorer}'>{address}</a>\n"
+                        f"🔴 Previous balance: {db_old_balance_kas:.2f} Kas\n"
+                        f"🟢 New balance: {api_balance_kas:.2f} Kas\n"
+                        f"💸 Amount {direction}: {difference_kas:+.2f} Kas (~${usd_amount:.2f} USD)\n"
+                        f"(Could not fetch specific transaction details for this alert)"
+                    )
                 
-                # If transaction has been in the queue for more than 5 minutes and still not accepted, remove it
-                elif (current_time - tx_info['first_seen']).total_seconds() > TRANSACTION_TIMEOUT:
-                    del pending_transactions[tx_id]
-                    logger.info(f"Transaction {tx_id} removed from waiting queue after {TRANSACTION_TIMEOUT} seconds (not accepted)")
+                if alert_message_text:
+                    try:
+                        # Check if the address is still being monitored by this chat
+                        async with db_conn.execute(
+                            "SELECT id FROM kaspa_addresses WHERE chat_id = ? AND address = ?",
+                            (chat_id, address)
+                        ) as cursor:
+                            address_still_monitored = await cursor.fetchone()
 
-# --- MONTHLY DONATION / DONATOR SUMMARY FUNCTION ---
+                        if address_still_monitored:  # Only send the alert if the address is still being monitored
+                            await bot.send_message(chat_id=chat_id, text=alert_message_text, parse_mode='HTML')
+                            logger.info(f"Sent alert to chat {chat_id} for address {address}.")
+                        else:
+                            logger.info(f"Skipping alert for chat {chat_id} and address {address} as it's no longer monitored.")
+                    except Forbidden:
+                        logger.error(f"Bot blocked or chat deleted for chat {chat_id}. Removing chat.")
+                        await remove_chat(chat_id)
+                    except Exception as e:
+                        logger.error(f"Error sending alert for {address} to chat {chat_id}: {e}")
+
 async def send_monthly_donation_message(bot) -> None:
-    """
-    This function is called every month and sends a donation summary.
-    The message lists the donations recorded this month and appends the following information:
-      - The donation address
-      - A message in English: "If you like my bot, even 1 kaspa helps keep the service operational."
-    """
     start_of_month = datetime.now(timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
     async with db_conn.execute(
         "SELECT sender_address, recipient_address, amount, record_date FROM donations WHERE record_date >= ?",
@@ -815,47 +715,36 @@ async def send_monthly_donation_message(bot) -> None:
 
     for (chat_id,) in chat_rows:
         try:
-            # Utilisez le bot directement comme dans check_addresses
             await bot.send_message(chat_id=chat_id, text=donation_message)
-        except Forbidden as e:
-            logger.error("Bot blocked or chat deleted for chat %s when sending monthly donation summary: %s", chat_id, e)
+        except Forbidden:
+            logger.error("Bot blocked or chat deleted for chat %s when sending monthly donation summary.", chat_id)
             await remove_chat(chat_id)
         except Exception as e:
             logger.error("Error sending monthly donation summary to chat %s: %s", chat_id, e)
 
-# --- GETTING THE PRICE OF KASPA ---
 async def update_kaspa_price():
-    """
-    Retrieves the price of Kaspa in USD via the CoinMarketCap API every 15 minutes.
-    In case of an error, logs the incident and keeps the last known value.
-    """
     global current_kaspa_price
     headers = {
          "Accept": "application/json",
-         "X-CMC_PRO_API_KEY": CMC_API_KEY  
+         "X-CMC_PRO_API_KEY": CMC_API_KEY
     }
-    # Using the unique ID for the request
     url = f"https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest?id={KASPA_CMC_ID}&convert=USD"
     async with aiohttp.ClientSession(headers=headers) as session:
-         data = await fetch_with_retry(session, url, timeout=10, retries=3)
-         if data:
+         data = await fetch_with_retry(session, url)
+         if data and "data" in data and str(KASPA_CMC_ID) in data["data"]:
              try:
-                 # Extract the price from the JSON response.
-                 # The key in 'data' corresponds to the used ID, here converted to a string.
                  price = data["data"][str(KASPA_CMC_ID)]["quote"]["USD"]["price"]
-                 current_kaspa_price = price
-                 logger.info("Kaspa price updated: %f USD", price)
-             except KeyError:
-                 logger.error("Invalid data format received from CoinMarketCap: %s", data)
+                 current_kaspa_price = float(price)
+                 logger.info("Kaspa price updated: %f USD", current_kaspa_price)
+             except (KeyError, TypeError, ValueError) as e:
+                 logger.error("Invalid data format or missing price from CoinMarketCap: %s. Error: %s", data, e)
          else:
-             # If the API does not respond, keep the last known value
-             logger.error("Error fetching the price. Last known value: %f USD", current_kaspa_price)
-             
-# --- MAIN ---
+             logger.error("Error fetching Kaspa price or unexpected response structure. Last known value: %f USD", current_kaspa_price)
+
 async def main() -> None:
     global db_conn
     db_conn = await init_db()
-    
+
     application = ApplicationBuilder().token(BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("wallet", add_address))
@@ -863,15 +752,13 @@ async def main() -> None:
     application.add_handler(CommandHandler("myaddresses", myaddresses))
     application.add_handler(CommandHandler("help", aide))
     application.add_handler(CallbackQueryHandler(delete_address_callback, pattern=r"^delete_address:\d+$"))
-    application.add_error_handler(error_handler)  # Register global error handler
+    application.add_error_handler(error_handler)
+    
     scheduler = AsyncIOScheduler(timezone="UTC")
-    # Optional: trigger a first update to initialize the variable immediately
-    await update_kaspa_price()
+    await update_kaspa_price() # Initial price fetch
     scheduler.add_job(update_kaspa_price, "interval", minutes=15)
-    # Monthly donation/donators summary job. Every 1st of the month at 00:00.
     scheduler.add_job(send_monthly_donation_message, "cron", day=1, hour=0, minute=0, args=[application.bot])
-    # Check monitored addresses every minute for new transactions.
-    scheduler.add_job(check_addresses, "interval", seconds=60, args=[application.bot])
+    scheduler.add_job(check_addresses, "interval", seconds=30, args=[application.bot])   
     scheduler.start()
 
     logger.info("Bot started...")
@@ -882,3 +769,6 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         logger.info("Bot stopped.")
+    finally:
+        if db_conn:
+            asyncio.run(db_conn.close()) # Ensure DB connection is closed
